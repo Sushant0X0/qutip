@@ -1,0 +1,114 @@
+# TEMPORARY - reproduction only for issue #3104, not meant to be merged.
+# Installs qutip master unchanged, then the `semidefinite` extras (cvxpy,
+# cvxopt) in separate steps so each failure is isolated, then runs the dnorm
+# tests and a per-seed diagnostic.
+name: Repro 3104
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [repro-3104]
+
+defaults:
+  run:
+    shell: bash -l -e -o pipefail {0}
+
+jobs:
+  repro:
+    name: ${{ matrix.os }}, python${{ matrix.python-version }} (${{ matrix.expect }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The two cases reported in the issue.
+          - os: macos-latest
+            python-version: "3.15"
+            expect: "cvxopt install fails, umfpack.h"
+          - os: macos-latest
+            python-version: "3.14"
+            expect: "dnorm SolverError"
+          # Open questions from the issue: lower Python on ARM, and Intel.
+          - os: macos-latest
+            python-version: "3.13"
+            expect: "unknown"
+          - os: macos-15-intel
+            python-version: "3.14"
+            expect: "unknown"
+          # Linux: 3.14 is the control (wheel exists, CI passes with [full]).
+          - os: ubuntu-latest
+            python-version: "3.14"
+            expect: "control, pass"
+          # No cp315 cvxopt wheel on Linux either: is 3.15 broken there too?
+          - os: ubuntu-latest
+            python-version: "3.15"
+            expect: "unknown"
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: conda-incubator/setup-miniconda@v4
+        with:
+          auto-update-conda: true
+          python-version: ${{ matrix.python-version }}
+          channels: conda-forge
+
+      - name: Install qutip (master, no extras)
+        run: |
+          conda install pip -y
+          python -m pip install . pytest pytest-rerunfailures
+          cd "$RUNNER_TEMP" && python -c "import qutip; qutip.about()"
+
+      - name: Install cvxpy
+        id: cvxpy
+        continue-on-error: true
+        run: python -m pip install "cvxpy>=1.4" -v 2>&1 | tee "$RUNNER_TEMP/cvxpy-install.log"
+
+      - name: Install cvxopt
+        id: cvxopt
+        continue-on-error: true
+        run: python -m pip install cvxopt -v 2>&1 | tee "$RUNNER_TEMP/cvxopt-install.log"
+
+      - name: Package and BLAS information
+        run: |
+          conda list | grep -Ei "python |numpy|scipy|cvx|scs|clarabel|osqp|blas|lapack|suitesparse" || true
+          python -m pip list
+          if python -c "import cvxopt" 2>/dev/null; then
+            so=$(python -c "import cvxopt.lapack as m; print(m.__file__)")
+            if [[ "$RUNNER_OS" == "macOS" ]]; then otool -L "$so"; else ldd "$so"; fi
+          fi
+
+      - name: Run dnorm tests (as CI does, reruns allowed)
+        id: tests
+        continue-on-error: true
+        working-directory: ${{ runner.temp }}
+        run: python -m pytest --pyargs qutip.tests.core.test_metrics -k dnorm -v -rs --color=yes
+
+      - name: Per-seed diagnostic
+        if: steps.cvxpy.outcome == 'success' && steps.cvxopt.outcome == 'success'
+        working-directory: ${{ runner.temp }}
+        run: python "$GITHUB_WORKSPACE/.github/repro_3104/diagnose_dnorm_3104.py" --seeds 30 --verbose-first-failure
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### ${{ matrix.os }} / Python ${{ matrix.python-version }}"
+            echo "expected: ${{ matrix.expect }}"
+            echo ""
+            echo "| step | outcome |"
+            echo "|---|---|"
+            echo "| install cvxpy | ${{ steps.cvxpy.outcome }} |"
+            echo "| install cvxopt | ${{ steps.cvxopt.outcome }} |"
+            echo "| dnorm tests | ${{ steps.tests.outcome }} |"
+            if grep -q "umfpack.h" "$RUNNER_TEMP/cvxopt-install.log" 2>/dev/null; then
+              echo ""
+              echo "cvxopt build log mentions umfpack.h:"
+              echo '```'
+              grep -m3 "umfpack.h" "$RUNNER_TEMP/cvxopt-install.log"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
